@@ -1,0 +1,224 @@
+using System;
+using System.Windows.Forms;
+using OxyPlot;
+using OxyPlot.Axes;
+using OxyPlot.Series;
+using OxyPlot.WindowsForms;
+
+class Program
+{
+    const int N = 80;           // 总节点数
+    const double dx = 2.5 / 79.0;  // 空间步长 (m)
+    const double epsilon = 1e-5;     // 收敛阈值
+    const int MAX_ITER = 10000;      // 最大迭代次数
+
+    [STAThread]
+    static void Main(string[] args)
+    {
+        double[] T = new double[N];
+        Array.Fill(T, 25.0);
+
+        var sync = new object();
+        var plotReady = false;
+
+        // ====================== 图表初始化 ======================
+        // 温度分布图
+        var tempPlotModel = new PlotModel
+        {
+            Title = "无因次温度分布",
+            DefaultFont = "微软雅黑",
+            TitleFontSize = 14
+        };
+        tempPlotModel.Axes.Add(new LinearAxis
+        {
+            Position = AxisPosition.Bottom,
+            Title = "y/h (距离/厚度)",
+            Minimum = 0,
+            Maximum = 1.0,
+            MajorStep = 0.2
+        });
+        tempPlotModel.Axes.Add(new LinearAxis
+        {
+            Position = AxisPosition.Left,
+            Title = "无因次温度",
+            Minimum = 0.0,
+            Maximum = 1.0
+        });
+        var temperatureSeries = new LineSeries
+        {
+            MarkerType = MarkerType.Circle,
+            Color = OxyColors.Blue
+        };
+        tempPlotModel.Series.Add(temperatureSeries);
+
+        // 残差收敛图
+        var residualPlotModel = new PlotModel
+        {
+            Title = "残差收敛曲线",
+            DefaultFont = "微软雅黑",
+            TitleFontSize = 14
+        };
+        residualPlotModel.Axes.Add(new LinearAxis
+        {
+            Position = AxisPosition.Bottom,
+            Title = "迭代次数",
+            Minimum = 0,
+            MajorStep = 50
+        });
+        residualPlotModel.Axes.Add(new LogarithmicAxis
+        {
+            Position = AxisPosition.Left,
+            Title = "残差",
+            Minimum = 1e-6,
+            Maximum = 1e+04,
+            MajorGridlineStyle = LineStyle.Dash
+        });
+        var residualSeries = new LineSeries
+        {
+            MarkerType = MarkerType.Cross,
+            Color = OxyColors.Red
+        };
+        residualPlotModel.Series.Add(residualSeries);
+
+        // ====================== UI线程初始化 ======================
+        PlotView tempPlotView = null;
+        PlotView residualPlotView = null;
+
+        var uiThread = new System.Threading.Thread(() =>
+        {
+            try
+            {
+                var form = new Form
+                {
+                    Text = "热传导仿真 - 双图展示",
+                    Width = 1600,
+                    Height = 600
+                };
+
+                // 温度图控件
+                tempPlotView = new PlotView
+                {
+                    Model = tempPlotModel,
+                    Width = 600,
+                    Height = 500,
+                    Left = 10,
+                    Top = 10
+                };
+
+                // 残差图控件
+                residualPlotView = new PlotView
+                {
+                    Model = residualPlotModel,
+                    Width = 900,
+                    Height = 500,
+                    Left = 610,
+                    Top = 10
+                };
+
+                form.Controls.Add(tempPlotView);
+                form.Controls.Add(residualPlotView);
+                form.FormClosed += (s, e) => Environment.Exit(0);
+
+                form.Load += (sender, e) =>
+                {
+                    lock (sync)
+                    {
+                        plotReady = true;
+                        System.Threading.Monitor.Pulse(sync);
+                    }
+                };
+
+                Application.Run(form);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"UI线程错误: {ex.Message}");
+            }
+        });
+
+        uiThread.SetApartmentState(System.Threading.ApartmentState.STA);
+        uiThread.Start();
+
+        lock (sync)
+        {
+            while (!plotReady)
+            {
+                System.Threading.Monitor.Wait(sync, 5000); // 5秒超时
+                if (!plotReady) throw new TimeoutException("UI线程初始化超时");
+            }
+        }
+
+        double lambda = 20;        // 导热系数 (W/(m·°C))
+        double alpha_1 = 80;       // 左边界对流系数 (W/(m²·°C))
+        double T_infty = 1200.0;  // 左环境温度 (°C)
+        double alpha_2 = 15.0;     // 右边界对流系数 (W/(m²·°C))
+        double T_right = 25.0;    // 右环境温度 (°C)
+        int iter = 0;
+        double residual;
+
+        // ====================== 迭代求解 ======================
+        do
+        {
+            residual = 0.0;
+            var T_new = new double[N];
+
+            // 更新边界条件
+            T_new[0] = (alpha_1 * T_infty * dx + lambda * T[1]) / (alpha_1 * dx + lambda);
+            T_new[N - 1] = (alpha_2 * T_right * dx + lambda * T[N - 2]) / (alpha_2 * dx + lambda);
+
+            // 更新内部节点
+            for (int i = 1; i < N - 1; i++)
+            {
+                T_new[i] = 0.5 * (T_new[i - 1] + T[i + 1]);
+            }
+
+            // 计算残差
+            for (int i = 0; i < N; i++)
+            {
+                residual = Math.Max(residual, Math.Abs(T_new[i] - T[i]));
+            }
+
+            // 更新全局温度
+            Array.Copy(T_new, T, N);
+
+            var tempPoints = new DataPoint[N];
+            for (int i = 0; i < N; i++)
+            {
+                tempPoints[i] = new DataPoint(
+                    (double)i / (N - 1),
+                    (T[i] - T_right) / (T_infty - T_right)
+                );
+            }
+
+            // ====================== 图表更新 ======================
+            if (tempPlotView.IsHandleCreated && residualPlotView.IsHandleCreated)
+            {
+                tempPlotView.Invoke((Action)(() =>
+                {
+                    temperatureSeries.Points.Clear();
+                    temperatureSeries.Points.AddRange(tempPoints);
+                    tempPlotModel.InvalidatePlot(true);
+                }));
+
+                residualPlotView.Invoke((Action)(() =>
+                {
+                    residualSeries.Points.Add(new DataPoint(iter, residual));
+                    residualPlotModel.InvalidatePlot(true);
+                }));
+            }
+
+
+
+            // 控制台输出关键信息
+            Console.WriteLine($"迭代: {iter} 残差: {residual:E3}, 左边界温度: {T[0]:F2}°C");
+
+            // 控制迭代速度
+            System.Threading.Thread.Sleep(50);
+            iter++;
+
+        } while (residual > epsilon && iter < MAX_ITER);
+
+        Console.WriteLine("\nPress any key to exit...");
+        uiThread.Join();
+    }
+}
